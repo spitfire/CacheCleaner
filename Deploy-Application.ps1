@@ -58,12 +58,12 @@ Try {
 	## Variables: Application
 	[string]$appVendor = 'International Paper'
 	[string]$appName = 'Cache Cleaner'
-	[string]$appVersion = '1.1'
+	[string]$appVersion = '1.2'
 	[string]$appArch = ''
 	[string]$appLang = 'EN'
 	[string]$appRevision = '01'
 	[string]$appScriptVersion = '1.0.0'
-	[string]$appScriptDate = '2017-07-14'
+	[string]$appScriptDate = '2017-10-05'
 	[string]$appScriptAuthor = 'Mieszko Ślusarczyk'
 	[bool]$showPostinstallMessage = $false
 	
@@ -184,8 +184,16 @@ Try {
 		}
 		
 		## <Perform Installation tasks here>
-		Clean-CMCacheOldItems
-		Clean-CMCacheOrphanedItems
+		If ($runningTaskSequence)
+		{
+			Write-Log "Info: Skipping ccmcache cleanup during task sequence."
+		}
+		Else
+		{
+			Clean-CMCacheOldItems
+			Clean-CMCacheOrphanedItems
+		}
+		
 		
 		Remove-TempFiles -Path "C:\Windows\Temp"
 		
