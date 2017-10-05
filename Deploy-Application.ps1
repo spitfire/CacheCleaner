@@ -56,17 +56,17 @@ Try {
 	##* VARIABLE DECLARATION
 	##*===============================================
 	## Variables: Application
-	[string]$appVendor = ''
-	[string]$appName = ''
-	[string]$appVersion = ''
+	[string]$appVendor = 'International Paper'
+	[string]$appName = 'Cache Cleaner'
+	[string]$appVersion = '1.1'
 	[string]$appArch = ''
 	[string]$appLang = 'EN'
 	[string]$appRevision = '01'
-	[string]$baseScriptVersion = '1.0.0'
 	[string]$appScriptVersion = '1.0.0'
-	[string]$appScriptDate = '2017-08-02'
+	[string]$appScriptDate = '2017-07-14'
 	[string]$appScriptAuthor = 'Mieszko Ślusarczyk'
 	[bool]$showPostinstallMessage = $false
+	
 	##*===============================================
 	## Variables: Install Titles (Only set here to override defaults set by the toolkit)
 	[string]$installName = ''
@@ -100,8 +100,48 @@ Try {
 		## Exit the script, returning the exit code to SCCM
 		If (Test-Path -LiteralPath 'variable:HostInvocation') { $script:ExitCode = $mainExitCode; Exit } Else { Exit $mainExitCode }
 	}
+	#region CMCommonFunctions
+	
+	Try
+	{
+		[string]$CMCommonFunctions = "$scriptDirectory\AppDeployToolkit\CMCommonFunctions.ps1"
+		If (-not (Test-Path -LiteralPath $CMCommonFunctions -PathType 'Leaf')) { Throw "Module does not exist at the specified location [$moduleCMCommonFunctions]." }
+		If ($DisableLogging) { . $CMCommonFunctions -DisableLogging }
+		Else { . $CMCommonFunctions }
+	}
+	Catch
+	{
+		If ($mainExitCode -eq 0) { [int32]$mainExitCode = 60009 }
+		Write-Error -Message "Module [$CMCommonFunctions] failed to load: `n$($_.Exception.Message)`n `n$($_.InvocationInfo.PositionMessage)" -ErrorAction 'Continue'
+		## Exit the script, returning the exit code to SCCM
+		If (Test-Path -LiteralPath 'variable:HostInvocation') { $script:ExitCode = $mainExitCode; Exit }
+		Else { Exit $mainExitCode }
+	}
+	
+	#endregion CMCommonFunctions
 	
 	#endregion
+	
+	#region CommonFunctions
+	
+	Try
+	{
+		[string]$CommonFunctions = "$scriptDirectory\AppDeployToolkit\CommonFunctions.ps1"
+		If (-not (Test-Path -LiteralPath $CommonFunctions -PathType 'Leaf')) { Throw "Module does not exist at the specified location [$moduleCommonFunctions]." }
+		If ($DisableLogging) { . $CommonFunctions -DisableLogging }
+		Else { . $CommonFunctions }
+	}
+	Catch
+	{
+		If ($mainExitCode -eq 0) { [int32]$mainExitCode = 60009 }
+		Write-Error -Message "Module [$CommonFunctions] failed to load: `n$($_.Exception.Message)`n `n$($_.InvocationInfo.PositionMessage)" -ErrorAction 'Continue'
+		## Exit the script, returning the exit code to SCCM
+		If (Test-Path -LiteralPath 'variable:HostInvocation') { $script:ExitCode = $mainExitCode; Exit }
+		Else { Exit $mainExitCode }
+	}
+	
+	#endregion
+	
 	##* Do not modify section above
 	$processes = ""
 	##*===============================================
@@ -115,7 +155,7 @@ Try {
 		[string]$installPhase = 'Pre-Installation'
 		
 		## Show Welcome Message, close apps specified in $processes, allow up to 2 deferrals (only if any of beforementioned processes is running), verify there is enough disk space to complete the install, and persist the prompt
-		If ($runningTaskSequence){ $DeployMode = 'NonInteractive'}
+		If ($runningTaskSequence) { $DeployMode = 'Silent' }
 		If ($processes)
 		{
 			Show-InstallationWelcome -CloseApps "$processes" -CloseAppsCountdown 3600 -AllowDeferCloseApps -BlockExecution -AllowDefer -DeferTimes 2 -CheckDiskSpace -PersistPrompt
@@ -130,7 +170,7 @@ Try {
 		Show-InstallationProgress
 		
 		## <Perform Pre-Installation tasks here>
-		
+		$FreeDiskSpaceOnStart = Get-FreeDiskSpace -Drive "$env:SystemDrive"
 		
 		##*===============================================
 		##* INSTALLATION 
@@ -144,7 +184,42 @@ Try {
 		}
 		
 		## <Perform Installation tasks here>
+		Clean-CMCacheOldItems
+		Clean-CMCacheOrphanedItems
 		
+		Remove-TempFiles -Path "C:\Windows\Temp"
+		
+		#region remove per-user Temp directories
+		Write-Log "Cleaning user profiles"
+		$userprofiles = Get-ChildItem "$env:SystemDrive\Users" | select FullName -ExpandProperty FullName
+		Foreach ($userprofile in $userprofiles)
+		{
+			Write-Log "Checking $userprofile"
+			If ("$userprofile\AppData\Local\Temp")
+			{
+				Write-Log "Info: Trying to remove files from $userprofile\AppData\Local\Temp"
+				Remove-TempFiles -Path "$userprofile\AppData\Local\Temp"
+			}
+			Else
+			{
+				Write-Log "$userprofile\AppData\Local\Temp does not exist"
+			}
+		}
+		Write-Log "End cleaning user profiles"
+		#endregion remove per-user Temp directories
+		#region C:\Software cleanup
+		$SoftwareFoldersToClean = Get-ChildItem -Path "$env:SystemDrive\Software" -Exclude "gsdutils","tools","Cisco_Anyconnect*" | select FullName -ExpandProperty FullName
+		ForEach ($SoftwareFolderToClean in $SoftwareFoldersToClean)
+		{
+			Remove-TempFiles -Path "$SoftwareFolderToClean"
+		}
+		#endregion C:\Software cleanup
+		
+		#region Windows Update cleanup
+		Stop-ServiceAndDependencies -Name 'wuauserv'
+		Remove-TempFiles -Path "$env:windir\SoftwareDistribution\Download"
+		Start-ServiceAndDependencies -Name 'wuauserv'
+		#endregion Windows Update cleanup
 		
 		##*===============================================
 		##* POST-INSTALLATION
@@ -152,7 +227,9 @@ Try {
 		[string]$installPhase = 'Post-Installation'
 		
 		## <Perform Post-Installation tasks here>
-		
+		$FreeDiskSpaceOnEnd = Get-FreeDiskSpace -Drive "$env:SystemDrive"
+		$CleanedDiskSpace = $FreeDiskSpaceOnEnd - $FreeDiskSpaceOnStart
+		Write-Log "Info: Cleaned up $CleanedDiskSpace MB"
 		## Display a message at the end of the install
 		If (-not $useDefaultMsi -and $showPostinstallMessage) { Show-InstallationPrompt -Message 'You can customize text to appear at the end of an install or remove it completely for unattended installations.' -ButtonRightText 'OK' -Icon Information -NoWait }
 	}
@@ -218,3 +295,110 @@ Catch {
 	Show-DialogBox -Text $mainErrorMessage -Icon 'Stop'
 	Exit-Script -ExitCode $mainExitCode
 }
+# SIG # Begin signature block
+# MIITkQYJKoZIhvcNAQcCoIITgjCCE34CAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
+# gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
+# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUJe/OXnkLFkH8DBEV1zTUrrhJ
+# N+uggg7fMIIEFDCCAvygAwIBAgILBAAAAAABL07hUtcwDQYJKoZIhvcNAQEFBQAw
+# VzELMAkGA1UEBhMCQkUxGTAXBgNVBAoTEEdsb2JhbFNpZ24gbnYtc2ExEDAOBgNV
+# BAsTB1Jvb3QgQ0ExGzAZBgNVBAMTEkdsb2JhbFNpZ24gUm9vdCBDQTAeFw0xMTA0
+# MTMxMDAwMDBaFw0yODAxMjgxMjAwMDBaMFIxCzAJBgNVBAYTAkJFMRkwFwYDVQQK
+# ExBHbG9iYWxTaWduIG52LXNhMSgwJgYDVQQDEx9HbG9iYWxTaWduIFRpbWVzdGFt
+# cGluZyBDQSAtIEcyMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAlO9l
+# +LVXn6BTDTQG6wkft0cYasvwW+T/J6U00feJGr+esc0SQW5m1IGghYtkWkYvmaCN
+# d7HivFzdItdqZ9C76Mp03otPDbBS5ZBb60cO8eefnAuQZT4XljBFcm05oRc2yrmg
+# jBtPCBn2gTGtYRakYua0QJ7D/PuV9vu1LpWBmODvxevYAll4d/eq41JrUJEpxfz3
+# zZNl0mBhIvIG+zLdFlH6Dv2KMPAXCae78wSuq5DnbN96qfTvxGInX2+ZbTh0qhGL
+# 2t/HFEzphbLswn1KJo/nVrqm4M+SU4B09APsaLJgvIQgAIMboe60dAXBKY5i0Eex
+# +vBTzBj5Ljv5cH60JQIDAQABo4HlMIHiMA4GA1UdDwEB/wQEAwIBBjASBgNVHRMB
+# Af8ECDAGAQH/AgEAMB0GA1UdDgQWBBRG2D7/3OO+/4Pm9IWbsN1q1hSpwTBHBgNV
+# HSAEQDA+MDwGBFUdIAAwNDAyBggrBgEFBQcCARYmaHR0cHM6Ly93d3cuZ2xvYmFs
+# c2lnbi5jb20vcmVwb3NpdG9yeS8wMwYDVR0fBCwwKjAooCagJIYiaHR0cDovL2Ny
+# bC5nbG9iYWxzaWduLm5ldC9yb290LmNybDAfBgNVHSMEGDAWgBRge2YaRQ2XyolQ
+# L30EzTSo//z9SzANBgkqhkiG9w0BAQUFAAOCAQEATl5WkB5GtNlJMfO7FzkoG8IW
+# 3f1B3AkFBJtvsqKa1pkuQJkAVbXqP6UgdtOGNNQXzFU6x4Lu76i6vNgGnxVQ380W
+# e1I6AtcZGv2v8Hhc4EvFGN86JB7arLipWAQCBzDbsBJe/jG+8ARI9PBw+DpeVoPP
+# PfsNvPTF7ZedudTbpSeE4zibi6c1hkQgpDttpGoLoYP9KOva7yj2zIhd+wo7AKvg
+# IeviLzVsD440RZfroveZMzV+y5qKu0VN5z+fwtmK+mWybsd+Zf/okuEsMaL3sCc2
+# SI8mbzvuTXYfecPlf5Y1vC0OzAGwjn//UYCAp5LUs0RGZIyHTxZjBzFLY7Df8zCC
+# BJ8wggOHoAMCAQICEhEh1pmnZJc+8fhCfukZzFNBFDANBgkqhkiG9w0BAQUFADBS
+# MQswCQYDVQQGEwJCRTEZMBcGA1UEChMQR2xvYmFsU2lnbiBudi1zYTEoMCYGA1UE
+# AxMfR2xvYmFsU2lnbiBUaW1lc3RhbXBpbmcgQ0EgLSBHMjAeFw0xNjA1MjQwMDAw
+# MDBaFw0yNzA2MjQwMDAwMDBaMGAxCzAJBgNVBAYTAlNHMR8wHQYDVQQKExZHTU8g
+# R2xvYmFsU2lnbiBQdGUgTHRkMTAwLgYDVQQDEydHbG9iYWxTaWduIFRTQSBmb3Ig
+# TVMgQXV0aGVudGljb2RlIC0gRzIwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK
+# AoIBAQCwF66i07YEMFYeWA+x7VWk1lTL2PZzOuxdXqsl/Tal+oTDYUDFRrVZUjtC
+# oi5fE2IQqVvmc9aSJbF9I+MGs4c6DkPw1wCJU6IRMVIobl1AcjzyCXenSZKX1GyQ
+# oHan/bjcs53yB2AsT1iYAGvTFVTg+t3/gCxfGKaY/9Sr7KFFWbIub2Jd4NkZrItX
+# nKgmK9kXpRDSRwgacCwzi39ogCq1oV1r3Y0CAikDqnw3u7spTj1Tk7Om+o/SWJMV
+# TLktq4CjoyX7r/cIZLB6RA9cENdfYTeqTmvT0lMlnYJz+iz5crCpGTkqUPqp0Dw6
+# yuhb7/VfUfT5CtmXNd5qheYjBEKvAgMBAAGjggFfMIIBWzAOBgNVHQ8BAf8EBAMC
+# B4AwTAYDVR0gBEUwQzBBBgkrBgEEAaAyAR4wNDAyBggrBgEFBQcCARYmaHR0cHM6
+# Ly93d3cuZ2xvYmFsc2lnbi5jb20vcmVwb3NpdG9yeS8wCQYDVR0TBAIwADAWBgNV
+# HSUBAf8EDDAKBggrBgEFBQcDCDBCBgNVHR8EOzA5MDegNaAzhjFodHRwOi8vY3Js
+# Lmdsb2JhbHNpZ24uY29tL2dzL2dzdGltZXN0YW1waW5nZzIuY3JsMFQGCCsGAQUF
+# BwEBBEgwRjBEBggrBgEFBQcwAoY4aHR0cDovL3NlY3VyZS5nbG9iYWxzaWduLmNv
+# bS9jYWNlcnQvZ3N0aW1lc3RhbXBpbmdnMi5jcnQwHQYDVR0OBBYEFNSihEo4Whh/
+# uk8wUL2d1XqH1gn3MB8GA1UdIwQYMBaAFEbYPv/c477/g+b0hZuw3WrWFKnBMA0G
+# CSqGSIb3DQEBBQUAA4IBAQCPqRqRbQSmNyAOg5beI9Nrbh9u3WQ9aCEitfhHNmmO
+# 4aVFxySiIrcpCcxUWq7GvM1jjrM9UEjltMyuzZKNniiLE0oRqr2j79OyNvy0oXK/
+# bZdjeYxEvHAvfvO83YJTqxr26/ocl7y2N5ykHDC8q7wtRzbfkiAD6HHGWPZ1BZo0
+# 8AtZWoJENKqA5C+E9kddlsm2ysqdt6a65FDT1De4uiAO0NOSKlvEWbuhbds8zkSd
+# wTgqreONvc0JdxoQvmcKAjZkiLmzGybu555gxEaovGEzbM9OuZy5avCfN/61PU+a
+# 003/3iCOTpem/Z8JvE3KGHbJsE2FUPKA0h0G9VgEB7EYMIIGIDCCBAigAwIBAgIT
+# UgAAABxN1D0InJGIbQAAAAAAHDANBgkqhkiG9w0BAQsFADA/MRMwEQYKCZImiZPy
+# LGQBGRYDY29tMRYwFAYKCZImiZPyLGQBGRYGaXBhcGVyMRAwDgYDVQQDEwdJUFN1
+# YkNBMB4XDTE3MDQxNzE1MTcyNVoXDTIwMDQxNjE1MTcyNVowHTEbMBkGA1UEAxMS
+# SW50ZXJuYXRpb25hbFBhcGVyMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCN
+# DHhqB9jdBRakFFWXJnNdj+ZuOYmN9g+U5v/xsgDam173evS5GV0Zj5w6yFmag1Fj
+# kjhyQmiZcilVrb2z+CU4mgmbkduCZai5/1NN6wiHqTsQyTlwyNCoGRTmHAzWdRgs
+# OJ4SHcW5YWKDSicThtUlEiCipueqLf6J55W0vSnvEwIDAQABo4ICuTCCArUwPgYJ
+# KwYBBAGCNxUHBDEwLwYnKwYBBAGCNxUIgfvTWYSZhyiDsYMahKiqM4SB+SaBGYW0
+# wReFytkCAgFkAgEMMBMGA1UdJQQMMAoGCCsGAQUFBwMDMAsGA1UdDwQEAwIHgDAM
+# BgNVHRMBAf8EAjAAMBsGCSsGAQQBgjcVCgQOMAwwCgYIKwYBBQUHAwMwHQYDVR0O
+# BBYEFKkBcsWCUlbQsQuvlGn8TdH+HNybMB8GA1UdIwQYMBaAFO/UWWdgalRzmf9r
+# cPCTbIgUSaTrMIHxBgNVHR8EgekwgeYwgeOggeCggd2GK2h0dHA6Ly9jZXJ0Lmlw
+# YXBlci5jb20vQ2VydERhdGEvSVBTdWJDQS5jcmyGga1sZGFwOi8vL0NOPUlQU3Vi
+# Q0EsQ049UzAyQVNDQSxDTj1DRFAsQ049UHVibGljJTIwS2V5JTIwU2VydmljZXMs
+# Q049U2VydmljZXMsQ049Q29uZmlndXJhdGlvbixEQz1pcGFwZXIsREM9Y29tP2Nl
+# cnRpZmljYXRlUmV2b2NhdGlvbkxpc3Q/YmFzZT9vYmplY3RDbGFzcz1jUkxEaXN0
+# cmlidXRpb25Qb2ludDCB8QYIKwYBBQUHAQEEgeQwgeEwNwYIKwYBBQUHMAKGK2h0
+# dHA6Ly9jZXJ0LmlwYXBlci5jb20vQ2VydERhdGEvSVBTdWJDQS5jcnQwgaUGCCsG
+# AQUFBzAChoGYbGRhcDovLy9DTj1JUFN1YkNBLENOPUFJQSxDTj1QdWJsaWMlMjBL
+# ZXklMjBTZXJ2aWNlcyxDTj1TZXJ2aWNlcyxDTj1Db25maWd1cmF0aW9uLERDPWlw
+# YXBlcixEQz1jb20/Y0FDZXJ0aWZpY2F0ZT9iYXNlP29iamVjdENsYXNzPWNlcnRp
+# ZmljYXRpb25BdXRob3JpdHkwDQYJKoZIhvcNAQELBQADggIBAGryNXWYcEAErDeM
+# nIORRnlVZchJd2qx6SdEmzX3YFYcoAqnLS6WMGyWLI6Ak2Yirf3xGrzanK42Jlkp
+# D+tP0fBzAUXlcA9cb3w/HIvWFdM+OZqI1YCnLv7tDeJu6cmN9IFhbaowcYC3VgBM
+# w8E3nVWfk99OxeGu/2Q0qZl2ry0LQfw+oI8smPMQekby1rR75EF2phMFef8nQtAz
+# 5NeLWxAU7AgM1vWig4N8LtoaUK8BmRLwV2D39Iddhds0XkWxQfyjYtAhhGH4oMq3
+# L7eFZ0Hi6psuAE3iWFhgXqgV+rlvX6f4Itt+UiktfkTxhuMAzQeNNhaKXwloD7/F
+# 122bD7k0mORD9xx1+jHPbpC0FgfXFccNTfyBTagIylaKDtrEdg0+gUGNCBhlgZfX
+# cM8QlT4aJ1IRB98mv58KbzNUPIVG8C+5bUCPhrFG4yo4AboP9706VplR/g8lT/nY
+# vOD8uqs+orXNlJ4AXB9Wxn6iik4H5ZyioBF5Zhma8yG/Lb1pzXvmZtwwxA61JOOD
+# HO8HQMJQDow4mkQFxs1HRx2k+UWzx0NfvnbzyR4ip39uS6UqXKMrLzIJ2/Gczm/i
+# cmNqo9xRc+kXjJXjFFgnJguG85OY9ALrpBfCUvqf1N27DnCHsfHCLLXny6SU+MaH
+# D69vPYBagfulKZqFHdaEdy/ZMPzoMYIEHDCCBBgCAQEwVjA/MRMwEQYKCZImiZPy
+# LGQBGRYDY29tMRYwFAYKCZImiZPyLGQBGRYGaXBhcGVyMRAwDgYDVQQDEwdJUFN1
+# YkNBAhNSAAAAHE3UPQickYhtAAAAAAAcMAkGBSsOAwIaBQCgeDAYBgorBgEEAYI3
+# AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMCMGCSqGSIb3DQEJBDEWBBTnKyvA+dzz
+# Ky6pXFRZz9WGRc0BuTANBgkqhkiG9w0BAQEFAASBgIIhNs9vhX5m7znbOAK9QU+N
+# 04rzJfbLQkpEy/nVC8MbJxnK5rQ/8nmwUb3dIweuxYR6jZEXybYJ0lkz+kcA1WO5
+# KhK6LasNLbhRuqe1asWmRbvgHJf/wcr0cGCVjSLzIdT9d/RwOcDvpzhTHzXjTr/c
+# ZjrzMEfizVgcJprG5lUfoYICojCCAp4GCSqGSIb3DQEJBjGCAo8wggKLAgEBMGgw
+# UjELMAkGA1UEBhMCQkUxGTAXBgNVBAoTEEdsb2JhbFNpZ24gbnYtc2ExKDAmBgNV
+# BAMTH0dsb2JhbFNpZ24gVGltZXN0YW1waW5nIENBIC0gRzICEhEh1pmnZJc+8fhC
+# fukZzFNBFDAJBgUrDgMCGgUAoIH9MBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEw
+# HAYJKoZIhvcNAQkFMQ8XDTE3MDgwMjEyMDQzMVowIwYJKoZIhvcNAQkEMRYEFJXN
+# tpLVMu8fo++z7TxfuWgMfJnKMIGdBgsqhkiG9w0BCRACDDGBjTCBijCBhzCBhAQU
+# Y7gvq2H1g5CWlQULACScUCkz7HkwbDBWpFQwUjELMAkGA1UEBhMCQkUxGTAXBgNV
+# BAoTEEdsb2JhbFNpZ24gbnYtc2ExKDAmBgNVBAMTH0dsb2JhbFNpZ24gVGltZXN0
+# YW1waW5nIENBIC0gRzICEhEh1pmnZJc+8fhCfukZzFNBFDANBgkqhkiG9w0BAQEF
+# AASCAQAC76ii3/XyUE3Vnsk8Rdz/udBEatt6fp15hTLU5vUj3TlNi5Qu2uNRa63S
+# eUA84xP+x8FrBmmfQu1PqUXeFH9fOqEHK7jVteIAIIooChmMtf5PzAifgWS0bJVt
+# NIHaIw5hMjlk8hBPFloMTtWXHTA7bNQkkgJsxkWlEoQvIJwLD05x+drr2dCtg6kL
+# QfIUk9pzwlPMnGgEAcWEgYlf1n0Mggr/nq/nFEAS3cwfuO3nz80071jPcVeKc5W8
+# lLDkPKfq1eK0NwT5/upOc+d/Oo7G6//U3eEaYFKoRqF80rmzv5WemAH6atcfaFq1
+# X9e3B5ektin5VcFC3k6Tpc34xnL8
+# SIG # End signature block
